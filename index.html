@@ -72,6 +72,14 @@
   <div class="bar"><span id="barFill" style="width:0"></span></div>
   <div class="status" id="status" style="display:none"></div>
 
+  <h2>Abwesenheiten (z. B. Arztbesuch)</h2>
+  <div id="absList"></div>
+  <div class="btns">
+    <button id="absOut" class="sec">🚪 Jetzt abmelden</button>
+    <button id="absAdd" class="sec">+ Abwesenheit nachtragen</button>
+  </div>
+  <p class="hint" id="absInfo">Abwesenheiten zählen nicht zur Arbeitszeit – das Arbeitsende verschiebt sich entsprechend nach hinten.</p>
+
   <h2>Rufbereitschaft</h2>
   <label class="chk"><input type="checkbox" id="rbActive"> Ich habe Rufbereitschaft</label>
   <div id="rbBox" style="display:none">
@@ -239,6 +247,46 @@ function rbRenderResult(rb) {
   return c;
 }
 
+// ---------- Abwesenheiten (z. B. Arztbesuch): abmelden / wieder anmelden ----------
+const todayKey = () => new Date().toDateString();
+const nowMin = () => { const n = new Date(); return n.getHours() * 60 + n.getMinutes(); };
+let absData = JSON.parse(localStorage.getItem("az_abs") || "null");
+if (!absData || absData.date !== todayKey()) absData = { date: todayKey(), list: [] };   // jeden Tag neu
+
+// Abwesenheiten als Minuten-Intervalle ab Arbeitsbeginn s (über Mitternacht fortlaufend); offen = noch abgemeldet
+function absIntervals(s) {
+  const rel = m => m < s ? m + 1440 : m;
+  return absData.list.map(a => {
+    const von = toMin(a.ab); if (von === null) return null;
+    const v = rel(von), b = a.zu ? rel(toMin(a.zu)) : Math.max(v, rel(nowMin()));
+    return b > v ? [v, b, !a.zu] : null;
+  }).filter(Boolean);
+}
+
+function absSave() {
+  absData.date = todayKey();
+  localStorage.setItem("az_abs", JSON.stringify(absData));
+  render();
+  scheduleAuto();
+}
+
+function absRenderList() {
+  $("absList").innerHTML = "";
+  absData.list.forEach((a, i) => {
+    const row = document.createElement("div"); row.className = "ein";
+    row.innerHTML = `<input type="time" aria-label="Abgemeldet um"> <input type="time" aria-label="Wieder angemeldet um"> <button title="Jetzt wieder anmelden">✅ Jetzt anmelden</button> <button class="sec" title="Abwesenheit löschen">✕</button>`;
+    const [ab, zu, inBtn, del] = row.children;
+    ab.value = a.ab; zu.value = a.zu;
+    inBtn.style.display = a.zu ? "none" : "";
+    ab.oninput = () => { a.ab = ab.value; absSave(); };
+    zu.oninput = () => { a.zu = zu.value; inBtn.style.display = a.zu ? "none" : ""; $("absOut").disabled = absData.list.some(x => !x.zu); absSave(); };
+    inBtn.onclick = () => { a.zu = fmtTime(nowMin()); absSave(); absRenderList(); };
+    del.onclick = () => { absData.list.splice(i, 1); absSave(); absRenderList(); };
+    $("absList").appendChild(row);
+  });
+  $("absOut").disabled = absData.list.some(a => !a.zu);
+}
+
 // ---------- Arbeitszeit ----------
 function calc() {
   const s = toMin($("start").value), e = toMin($("end").value);
@@ -251,19 +299,22 @@ function calc() {
   const wd = workDayStart(ws);
   const ein = rb.active ? Math.round(overlap(rb.list, wd, new Date(wd.getTime() + 24 * H))) : 0;
   const regel = rb.active ? rb.regel : 480;
-  const r = { s, ws, wd, ein, regel, rb: rb.active, latest: s + PAUSE + MAX_NET - ein, end8: s + PAUSE + regel - ein };
+  // Abwesenheiten verschieben das Arbeitsende nach hinten
+  const abs = absIntervals(s), absAll = abs.reduce((t, [a, b]) => t + b - a, 0);
+  const r = { s, ws, wd, ein, regel, rb: rb.active, absAll, absOpen: abs.some(x => x[2]),
+              latest: s + PAUSE + MAX_NET - ein + absAll, end8: s + PAUSE + regel - ein + absAll };
   r.target = r.rb ? Math.min(r.end8, r.latest) : r.latest;   // darauf zielt die Erinnerung
   r.targetName = r.rb ? "Regelarbeitszeit" : "10-Std.-Grenze";
   if (e !== null) {
     let brutto = e - s; if (brutto < 0) brutto += 1440;
     r.brutto = brutto;
-    r.netto = Math.max(0, brutto - PAUSE);
   } else {
     // ohne Ende: aktueller Stand bis jetzt
-    const now = new Date(), n = now.getHours() * 60 + now.getMinutes();
-    let brutto = n - s; if (brutto < 0) brutto = 0;
-    r.brutto = brutto; r.netto = Math.max(0, brutto - PAUSE); r.live = true;
+    r.brutto = Math.max(0, nowMin() - s); r.live = true;
   }
+  // nur Abwesenheiten zwischen Beginn und Ende (bzw. jetzt) mindern die Netto-Zeit
+  r.abs = abs.reduce((t, [a, b]) => t + Math.max(0, Math.min(b, s + r.brutto) - Math.max(a, s)), 0);
+  r.netto = Math.max(0, r.brutto - PAUSE - r.abs);
   r.total = r.netto + ein;
   return r;
 }
@@ -281,6 +332,8 @@ function render() {
   $("btnOutlook").textContent = rbOn ? "📅 10-Std.-Termin in Outlook" : "📅 Termin in Outlook";
 
   const r = calc(), st = $("status");
+  $("absInfo").textContent = !r || !r.absAll ? "Abwesenheiten zählen nicht zur Arbeitszeit – das Arbeitsende verschiebt sich entsprechend nach hinten."
+    : (r.absOpen ? "🚪 Du bist gerade abgemeldet. " : "") + `Abwesend heute: ${fmtDur(r.absAll)} – alle Arbeitsenden verschieben sich um diese Zeit nach hinten.`;
   if (!r) { ["brutto","netto","end8","end10"].forEach(id => $(id).textContent = "–"); st.style.display = "none"; return; }
   const live = r.live ? " *" : "";
   $("brutto").textContent = fmtDur(r.brutto) + live;
@@ -297,6 +350,7 @@ function render() {
   else if (rest < 0) { cls = "bad"; txt = `⚠️ Regelarbeitszeit im 24-Std.-Arbeitstag um ${fmtDur(-rest)} überschritten!${einTxt}`; }
   else if (rest <= 60) { cls = "warn"; txt = `Achtung: nur noch ${fmtDur(rest)} bis zur ${r.targetName} (${fmtTime(r.target)}).${einTxt}`; }
   else { cls = "ok"; txt = `✔ Im Rahmen – noch ${fmtDur(rest)} bis zur ${r.targetName}.${einTxt}` + (r.live ? " (* Stand jetzt)" : ""); }
+  if (r.absOpen) txt = "🚪 Abgemeldet – die Arbeitszeit läuft nicht. " + txt;
   // Arbeitsbeginn heute vor dem frühesten erlaubten Beginn nach einem Einsatz?
   if (check && r.ws < check.earliest && check.earliest - r.ws < 24 * H && r.ws.toDateString() === check.earliest.toDateString()) {
     cls = "bad"; txt = `⚠️ Arbeitsbeginn ${fmtTime(r.s)} zu früh – wegen Ruhezeit nach dem Einsatz frühestens ${fmtTime(check.earliest.getHours() * 60 + check.earliest.getMinutes())}. ` + txt;
@@ -320,6 +374,7 @@ function reminders(r) {
 
 function mailBody(r, lead) {
   let b = `Hallo David,\n\nArbeitsbeginn: ${fmtTime(r.s)}\nMittagspause: 40 Min.\n`;
+  if (r.absAll) b += `Abwesenheiten: ${absData.list.filter(a => a.ab).map(a => `${a.ab}–${a.zu || "offen"}`).join(", ")} (gesamt ${fmtDur(r.absAll)})\n`;
   if (r.rb) b += `Rufbereitschaft: ja – Einsätze im 24-Std.-Arbeitstag: ${fmtDur(r.ein)}\nArbeitsende lt. Regelarbeitszeit (${fmtDur(r.regel)} netto): ${fmtTime(r.end8)} – bitte nicht überschreiten!\n`;
   else b += `Arbeitsende bei 8 Std. netto: ${fmtTime(r.end8)}\n`;
   b += `Spätestes Arbeitsende (10 Std. netto): ${fmtTime(r.latest)}\n\n`;
@@ -428,6 +483,7 @@ async function autoSend() {
 function scheduleAuto() {
   if (!AUTO || !$("start").value) return;
   clearTimeout(autoTimer);
+  if (absData.list.some(a => !a.zu)) { showAuto("warn", "🚪 Abgemeldet – Mail und Kalender werden nach dem Wieder-Anmelden aktualisiert."); return; }
   showAuto("warn", "⏳ Automatische Mail + Kalendereintrag in 3 Sekunden …");
   autoTimer = setTimeout(autoSend, 3000);   // kurz warten, bis die Eingabe fertig ist
 }
@@ -456,6 +512,10 @@ $("rbAdd").onclick = () => {
   rbEin.push({ von: v, bis: "" }); rbSave(); rbRenderList();
 };
 rbRenderList();
+
+$("absOut").onclick = () => { absData.list.push({ ab: fmtTime(nowMin()), zu: "" }); absSave(); absRenderList(); };
+$("absAdd").onclick = () => { absData.list.push({ ab: "", zu: "" }); absRenderList(); };
+absRenderList();
 
 $("start").value = localStorage.getItem("az_start") || "";
 $("lead").value = localStorage.getItem("az_lead") || "15";
